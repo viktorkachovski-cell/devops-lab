@@ -1,0 +1,89 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths: ["app/**", "charts/**", ".github/workflows/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r app/requirements-dev.txt
+      - run: python -m pytest -q
+        working-directory: app
+      - run: helm lint charts/dicey
+
+  e2e:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: ci
+      - name: Build image and load it into the throwaway cluster
+        run: |
+          docker build -t dicey:ci app
+          kind load docker-image dicey:ci --name ci
+      - name: Deploy with Helm
+        run: |
+          helm install dicey charts/dicey \
+            --set image.repository=dicey --set image.tag=ci \
+            --set image.pullPolicy=Never --set ingress.enabled=false \
+            --wait --timeout 120s
+      - name: Smoke test
+        run: |
+          kubectl port-forward svc/dicey 8080:80 &
+          for i in $(seq 1 15); do curl -fsS localhost:8080/healthz && break; sleep 2; done
+          curl -fsS localhost:8080/roll
+      - name: Debug info on failure
+        if: failure()
+        run: |
+          kubectl get pods -A
+          kubectl describe pods -l app=dicey
+          kubectl logs -l app=dicey --tail=50
+
+  publish:
+    needs: e2e
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: vars
+        run: |
+          echo "image=ghcr.io/devops/dicey" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}
+            ${{ steps.vars.outputs.image }}:latest
+      # Week 6: uncomment to hand the new tag to ArgoCD
+      # - name: Bump image tag for ArgoCD
+      #   env:
+      #     TAG: ${{ steps.vars.outputs.tag }}
+      #   run: |
+      #     yq -i ".image.tag = \"$TAG\"" deploy/values-local.yaml
+      #     git config user.name "github-actions[bot]"
+      #     git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      #     git commit -am "deploy: dicey $TAG"
+      #     git pull --rebase && git push

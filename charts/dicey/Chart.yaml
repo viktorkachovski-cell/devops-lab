@@ -1,0 +1,6 @@
+apiVersion: v2
+name: dicey
+description: A tiny dice-rolling service for learning K8s, Helm and observability
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
